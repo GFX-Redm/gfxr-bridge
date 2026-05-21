@@ -312,6 +312,77 @@ exports('GetInventory', function(source)
     return {}
 end)
 
+--- Alias for GetInventory (UI scripts expect Bridge:GetItems)
+---@param source number
+---@return table
+exports('GetItems', function(source)
+    return exports['gfxr-bridge']:GetInventory(source)
+end)
+
+--- Get a specific item by slot (best-effort, framework-dependent)
+---@param source number
+---@param slot number
+---@return table|nil
+exports('GetItemBySlot', function(source, slot)
+    if Bridge.InventoryName == "vorp_inventory" then
+        local ok, item = pcall(function()
+            return exports.vorp_inventory:getItemInSlot(source, slot)
+        end)
+        if ok then return item end
+    elseif Bridge.InventoryName == "rsg-inventory" then
+        local player = exports['gfxr-bridge']:GetPlayer(source)
+        if player and player.PlayerData and player.PlayerData.items then
+            for _, it in pairs(player.PlayerData.items) do
+                if (it.slot or it.position) == slot then return it end
+            end
+        end
+    elseif Bridge.InventoryName == "redemrp_inventory" then
+        local inv = exports.redemrp_inventory:getInventory(source) or {}
+        for _, it in pairs(inv) do
+            if (it.slot or it.position) == slot then return it end
+        end
+    end
+    return nil
+end)
+
+--- Use an item (manually triggers the framework's use handler, if exposed)
+---@param source number
+---@param item string
+---@return boolean
+exports('UseItem', function(source, item)
+    if Bridge.InventoryName == "vorp_inventory" then
+        local ok = pcall(function() exports.vorp_inventory:useItem(source, item, nil) end)
+        return ok
+    elseif Bridge.InventoryName == "rsg-inventory" then
+        local ok = pcall(function() exports['rsg-inventory']:UseItem(source, item) end)
+        return ok
+    elseif Bridge.InventoryName == "redemrp_inventory" then
+        local ok = pcall(function() exports.redemrp_inventory:useItem(source, item) end)
+        return ok
+    end
+    return false
+end)
+
+--- Update metadata on a specific item instance (where supported)
+---@param source number
+---@param slot number
+---@param metadata table
+---@return boolean
+exports('SetItemMetadata', function(source, slot, metadata)
+    if Bridge.InventoryName == "vorp_inventory" then
+        local ok = pcall(function()
+            exports.vorp_inventory:setItemMetadata(source, slot, metadata)
+        end)
+        return ok
+    elseif Bridge.InventoryName == "rsg-inventory" then
+        local ok = pcall(function()
+            exports['rsg-inventory']:SetItemMetadata(source, slot, metadata)
+        end)
+        return ok
+    end
+    return false
+end)
+
 --- Register a useable item
 ---@param item string
 ---@param handler function
