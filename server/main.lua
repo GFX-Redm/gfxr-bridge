@@ -72,7 +72,7 @@ end)
 ---@param source number
 ---@return string
 exports('GetPlayerName', function(source)
-    if Bridge.FrameworkName == "vorp" then
+    if Bridge.FrameworkName == "vorp" or Bridge.FrameworkName == "redem" then
         local player = exports['gfxr-bridge']:GetPlayer(source)
         if player then
             return player.firstname .. " " .. player.lastname
@@ -82,11 +82,6 @@ exports('GetPlayerName', function(source)
         if player then
             local ci = player.PlayerData.charinfo
             return ci.firstname .. " " .. ci.lastname
-        end
-    elseif Bridge.FrameworkName == "redem" then
-        local player = exports['gfxr-bridge']:GetPlayer(source)
-        if player then
-            return player.firstname .. " " .. player.lastname
         end
     end
     return GetPlayerName(source) or "Unknown"
@@ -230,6 +225,29 @@ exports('GetMoney', function(source, type)
             end
         end
     end
+    return 0
+end)
+
+--- Get player bank balance, framework-agnostic.
+--- RSG and RedEM expose a bank balance natively. VORP core has NO standardized
+--- bank balance (banking is a separate optional resource, not on the character
+--- object), so VORP returns 0 — scripts needing VORP banking must query that
+--- resource directly. (Confirmed via gfxr-bridge-expert + cached VORP refs.)
+---@param source number
+---@return number
+exports('GetBank', function(source)
+    if Bridge.FrameworkName == "rsg" then
+        local player = exports['gfxr-bridge']:GetPlayer(source)
+        if player then
+            return player.PlayerData.money.bank or 0
+        end
+    elseif Bridge.FrameworkName == "redem" then
+        local player = exports['gfxr-bridge']:GetPlayer(source)
+        if player then
+            return player.bankmoney or 0
+        end
+    end
+    -- VORP: no standardized core bank balance.
     return 0
 end)
 
@@ -539,4 +557,77 @@ exports('SetPlayerJob', function(source, job, grade)
             player.setJob(job)
         end
     end
+end)
+
+-- ══════════════════════════════════════════
+-- NEEDS / METABOLISM
+-- ══════════════════════════════════════════
+
+--- Get player needs (hunger / thirst / stress), framework-agnostic.
+--- All values are normalized to 0-100 integers. Frameworks without a
+--- "stress" concept (VORP) return stress = 0.
+---@param source number
+---@return table {hunger:number, thirst:number, stress:number}
+exports('GetNeeds', function(source)
+    if Bridge.FrameworkName == "vorp" then
+        -- VORP: hunger/thirst are NOT plain fields on the character — vorp_metabolism
+        -- persists them in the character's `status` JSON (UserCharacter.setStatus /
+        -- UserCharacter.status), keyed `Hunger`/`Thirst`/`Metabolism` on a 0-1000 scale.
+        -- We decode it and normalize to 0-100. VORP core has no stress concept.
+        -- (Source: VORPCORE/vorp_metabolism server/server.lua + client/apiCalls.lua —
+        --  cached at .claude/refs/cache/vorp-metabolism.md.)
+        local player = exports['gfxr-bridge']:GetPlayer(source)
+        if player then
+            local raw = player.status
+            if type(raw) == "string" and raw ~= "" then
+                local ok, s = pcall(json.decode, raw)
+                if ok and type(s) == "table" then
+                    return {
+                        hunger = math.floor((s.Hunger or 0) / 10),
+                        thirst = math.floor((s.Thirst or 0) / 10),
+                        stress = 0,
+                    }
+                end
+            elseif type(raw) == "table" then
+                -- Some VORP builds expose status as an already-decoded table.
+                return {
+                    hunger = math.floor((raw.Hunger or 0) / 10),
+                    thirst = math.floor((raw.Thirst or 0) / 10),
+                    stress = 0,
+                }
+            end
+            return { hunger = 0, thirst = 0, stress = 0 }
+        end
+    elseif Bridge.FrameworkName == "rsg" then
+        -- RSG: hunger/thirst/stress in PlayerData.metadata.
+        local player = exports['gfxr-bridge']:GetPlayer(source)
+        if player and player.PlayerData and player.PlayerData.metadata then
+            local md = player.PlayerData.metadata
+            return {
+                hunger = md.hunger or 0,
+                thirst = md.thirst or 0,
+                stress = md.stress or 0,
+            }
+        end
+    elseif Bridge.FrameworkName == "redem" then
+        -- RedEM:RP: structure varies by build — values may be nested in a
+        -- `status` table or set directly on the player object.
+        local player = exports['gfxr-bridge']:GetPlayer(source)
+        if player then
+            local status = player.status
+            return {
+                hunger = (status and status.hunger) or player.hunger or 0,
+                thirst = (status and status.thirst) or player.thirst or 0,
+                stress = (status and status.stress) or player.stress or 0,
+            }
+        end
+    end
+    return { hunger = 0, thirst = 0, stress = 0 }
+end)
+
+-- Server callback backing the client OnNeedsChange RedEM fallback poll (RSG reads
+-- metadata client-side and VORP listens to vorp_metabolism events, so only RedEM
+-- uses this). Registered via the bridge's own callback system.
+exports['gfxr-bridge']:RegisterCallback('gfxr-bridge:getNeeds', function(src)
+    return exports['gfxr-bridge']:GetNeeds(src)
 end)
