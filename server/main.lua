@@ -34,6 +34,32 @@ exports('GetPlayer', function(source)
     return nil
 end)
 
+--- Get the detected framework name ("vorp" | "rsg" | "redem" | nil).
+---@return string|nil
+exports('GetFramework', function()
+    return Bridge.FrameworkName
+end)
+
+--- Framework-agnostic admin check. True for: the server console (src 0), any
+--- player with the `command` ACE (txAdmin / console-granted admins), or whose
+--- framework group is admin/superadmin/mod.
+---@param source number
+---@return boolean
+exports('IsAdmin', function(source)
+    if not source or source == 0 then return true end
+    if IsPlayerAceAllowed(source, 'command') then return true end
+    local ok, player = pcall(function() return exports['gfxr-bridge']:GetPlayer(source) end)
+    if ok and player then
+        local group = player.group
+            or (player.PlayerData and player.PlayerData.group)
+            or (player.PlayerData and player.PlayerData.metadata and player.PlayerData.metadata.group)
+        if group == 'admin' or group == 'superadmin' or group == 'mod' or group == 'moderator' then
+            return true
+        end
+    end
+    return false
+end)
+
 --- Get player identifier (citizenid / charid / identifier)
 ---@param source number
 ---@return string|nil

@@ -9,6 +9,12 @@ local function GetCore()
     return Core
 end
 
+--- Get the detected framework name ("vorp" | "rsg" | "redem" | nil).
+---@return string|nil
+exports('GetFramework', function()
+    return Bridge.FrameworkName
+end)
+
 --- Send a framework-agnostic notification to the local player
 ---@param message string
 ---@param type string|nil "success"|"error"|"info"|nil
@@ -34,21 +40,26 @@ end)
 ---@return table|nil
 exports('GetPlayerData', function()
     if Bridge.FrameworkName == "vorp" then
-        local user = exports.vorp_core:GetUser()
-        if user then
-            local char = user.getUsedCharacter
+        -- VORP has NO client `GetUser` export (that is server-side only; the client
+        -- vorp_core only exports `GetCore`). The selected character is mirrored into
+        -- the `LocalPlayer.state.Character` statebag by vorp_core server/class/user.lua
+        -- (re-set on every money/job change, so reads are always current). Fields:
+        -- Group, FirstName, LastName, Job, JobLabel, Grade, Gender, Age, Money, Gold,
+        -- Rol, CharId. Returns nil until a character is selected so callers never throw.
+        local char = LocalPlayer and LocalPlayer.state and LocalPlayer.state.Character
+        if char then
             return {
-                identifier = char.identifier,
-                name = char.firstname .. " " .. char.lastname,
-                firstname = char.firstname,
-                lastname = char.lastname,
-                job = char.job,
-                jobLabel = char.joblabel,
-                jobGrade = char.jobgrade,
-                money = char.money,
-                gold = char.gold,
-                rol = char.rol,
-                group = char.group,
+                identifier = char.CharId,
+                name = (char.FirstName or "") .. " " .. (char.LastName or ""),
+                firstname = char.FirstName,
+                lastname = char.LastName,
+                job = char.Job,
+                jobLabel = char.JobLabel,
+                jobGrade = char.Grade,
+                money = char.Money,
+                gold = char.Gold,
+                rol = char.Rol,
+                group = char.Group,
             }
         end
     elseif Bridge.FrameworkName == "rsg" then
@@ -93,16 +104,7 @@ end)
 ---@param ... any
 ---@return any
 exports('TriggerCallback', function(name, ...)
-    if Bridge.FrameworkName == "vorp" then
-        local result = nil
-        local finished = false
-        TriggerServerEvent("vorp:serverCallback", name, function(...)
-            result = ...
-            finished = true
-        end, ...)
-        while not finished do Wait(0) end
-        return result
-    elseif Bridge.FrameworkName == "rsg" then
+    if Bridge.FrameworkName == "rsg" then
         local core = GetCore()
         if core then
             local p = promise:new()
@@ -361,10 +363,44 @@ RegisterNetEvent('redemrp:playerLoaded', function()
     OnPlayerLoaded()
 end)
 
--- Fallback for other frameworks
+-- Fallback ONLY for unknown frameworks. For VORP/RSG/RedEM we must NOT use
+-- `playerSpawned` — it fires when the ped spawns into the world (which on VORP
+-- can happen during the character-selection camera, BEFORE a character is
+-- actually picked), firing OnPlayerLoaded too early and showing feature UIs
+-- (e.g. the HUD) over the selection screen. Those frameworks fire their own
+-- "character selected" event above, and the startup poll below is the safety net.
 AddEventHandler('playerSpawned', function()
+    if Bridge.FrameworkName then return end
     Wait(2000)
     OnPlayerLoaded()
+end)
+
+-- Mid-session resource restart: the framework's "character selected" event has
+-- ALREADY fired (when the player first picked their character), so it will not
+-- fire again just because gfxr-bridge restarted — leaving `playerLoaded` stuck
+-- false and any OnPlayerLoaded subscriber (e.g. the HUD) never running. So on
+-- bridge start, detect an already-loaded character and fire OnPlayerLoaded now.
+CreateThread(function()
+    -- Try briefly: covers both fresh start (char not yet selected -> the events
+    -- above handle it) and a restart while already in-world.
+    for _ = 1, 40 do -- ~20s max
+        if playerLoaded then return end
+        local loaded = false
+        if Bridge.FrameworkName == "vorp" then
+            loaded = (LocalPlayer and LocalPlayer.state and LocalPlayer.state.Character) ~= nil
+        elseif Bridge.FrameworkName == "rsg" then
+            local core = GetCore()
+            local pData = core and core.Functions and core.Functions.GetPlayerData()
+            loaded = pData ~= nil and pData.citizenid ~= nil
+        elseif Bridge.FrameworkName == "redem" then
+            loaded = exports.redemrp:getPlayer() ~= nil
+        end
+        if loaded then
+            OnPlayerLoaded()
+            return
+        end
+        Wait(500)
+    end
 end)
 
 --- Register a callback for when player character is loaded
