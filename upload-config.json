@@ -1,0 +1,20 @@
+{
+  "name": "gfxr-bridge",
+  "exclude": [
+    "upload-config.json",
+    ".git/**",
+    ".gitignore",
+    ".github/**",
+    ".vscode/**",
+    "*.md"
+  ],
+  "versions": {
+    "escrow": {
+      "assetId": 906630,
+      "displayName": "GFX RedM Bridge (Escrow)",
+      "escrowIgnore": [
+        "shared/main.lua"
+      ]
+    }
+  }
+}
