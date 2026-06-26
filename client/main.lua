@@ -271,12 +271,28 @@ local function startNeedsWatcher()
     needsWatcherStarted = true
 
     if Bridge.FrameworkName == "rsg" then
-        -- RSG: SetMetaData has no dedicated event, but every PlayerData change
-        -- (incl. metadata hunger/thirst/stress) re-fires SetPlayerData. Verified
-        -- in rsg-core server/player.lua (UpdatePlayerData -> SetPlayerData).
+        -- RSG: SetMetaData -> UpdatePlayerData -> RSGCore:Player:SetPlayerData carries
+        -- the full PlayerData (incl. metadata hunger/thirst/stress). Verified in
+        -- rsg-core server/player.lua.
         RegisterNetEvent('RSGCore:Player:SetPlayerData', function()
             dispatchNeeds(readRsgNeeds())
         end)
+        -- ALSO listen to the canonical hud:client needs events (what rsg-hud uses):
+        -- some needs/consumable systems fire these lightweight events with the new
+        -- value instead of a full SetPlayerData, so without them a drain could be
+        -- missed. Each carries the changed value(s); merge over the last snapshot.
+        local function merge(h, t, s)
+            local cur = lastNeeds or readRsgNeeds() or { hunger = 100, thirst = 100, stress = 0 }
+            dispatchNeeds({
+                hunger = math.floor(h ~= nil and h or cur.hunger),
+                thirst = math.floor(t ~= nil and t or cur.thirst),
+                stress = math.floor(s ~= nil and s or cur.stress),
+            })
+        end
+        RegisterNetEvent('hud:client:UpdateNeeds',  function(h, t) merge(h, t, nil) end)
+        RegisterNetEvent('hud:client:UpdateHunger', function(h)    merge(h, nil, nil) end)
+        RegisterNetEvent('hud:client:UpdateThirst', function(t)    merge(nil, t, nil) end)
+        RegisterNetEvent('hud:client:UpdateStress', function(s)    merge(nil, nil, s) end)
     elseif Bridge.FrameworkName == "vorp" then
         -- VORP: vorp_metabolism drains client-side SILENTLY (no per-tick event),
         -- but exposes current values via the local `vorpmetabolism:getValue(key,cb)`
