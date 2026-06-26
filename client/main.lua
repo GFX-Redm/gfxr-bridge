@@ -66,18 +66,27 @@ exports('GetPlayerData', function()
         local core = GetCore()
         if core then
             local pData = core.Functions.GetPlayerData()
+            -- Early in load (or before character select) RSG returns a partial table
+            -- with no charinfo/job/money yet. Guard every nested field so the export
+            -- returns nil (like the VORP branch) instead of throwing
+            -- "attempt to index a nil value (field 'charinfo')".
+            if not pData or not pData.charinfo then return nil end
+            local ci    = pData.charinfo
+            local job   = pData.job or {}
+            local grade = job.grade or {}
+            local money = pData.money or {}
             return {
                 identifier = pData.citizenid,
-                name = pData.charinfo.firstname .. " " .. pData.charinfo.lastname,
-                firstname = pData.charinfo.firstname,
-                lastname = pData.charinfo.lastname,
-                job = pData.job.name,
-                jobLabel = pData.job.label,
-                jobGrade = pData.job.grade.level,
-                money = pData.money.cash,
-                gold = pData.money.bloodmoney or 0,
-                bank = pData.money.bank or 0,
-                group = pData.job.name,
+                name = (ci.firstname or "") .. " " .. (ci.lastname or ""),
+                firstname = ci.firstname,
+                lastname = ci.lastname,
+                job = job.name,
+                jobLabel = job.label,
+                jobGrade = grade.level,
+                money = money.cash,
+                gold = money.bloodmoney or 0,
+                bank = money.bank or 0,
+                group = job.name,
             }
         end
     elseif Bridge.FrameworkName == "redem" then

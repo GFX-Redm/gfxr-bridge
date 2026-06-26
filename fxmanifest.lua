@@ -5,7 +5,9 @@ lua54 'yes'
 
 author "GFX Development"
 description "Multi-framework bridge for RedM (VORP, RSG, RedEM:RP)"
-version '1.0.0'
+-- 1.1.0: added client exports OnMoneyChange + OnNeedsChange (event-driven money/needs);
+--        VORP TriggerCallback transport fix. Feature scripts (gfxr-hud) require these.
+version '1.1.0'
 
 shared_scripts { 'shared/*.lua' }
 client_scripts { 'client/*.lua' }
