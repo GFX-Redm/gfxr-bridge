@@ -23,6 +23,28 @@ local SQLScripts = {
     { name = "mysql-async",   resource = "mysql-async" },
 }
 
+--- Envanter tespiti. Ayri fonksiyon, cunku envanter kaynagi bridge'e BAGIMLI:
+--- bridge restart edildiginde bagimlilar durur ve Init sirasinda 'stopped' gorunur;
+--- asagidaki onResourceStart kancasi onlar acilinca tespiti tekrarlar.
+function Bridge.DetectInventory()
+    for _, inv in ipairs(Inventories) do
+        if GetResourceState(inv.resource) == "started" then
+            Bridge.InventoryName = inv.name
+            Bridge.InventoryResource = inv.resource
+            return Bridge.InventoryName
+        end
+    end
+    -- gfxr-inventory orijinal envanterin yerine gecebilir (`provide 'vorp_inventory'`,
+    -- `rsg-inventory`, `redemrp_inventory`). O zaman KAYNAK adi eslesmez ama export
+    -- yuzeyi aynidir; framework'e gore isimlendirip mevcut dallarin calismasini saglariz.
+    if GetResourceState("gfxr-inventory") == "started" then
+        local provided = { vorp = "vorp_inventory", rsg = "rsg-inventory", redem = "redemrp_inventory" }
+        Bridge.InventoryName = provided[Bridge.FrameworkName]
+        Bridge.InventoryResource = "gfxr-inventory"
+    end
+    return Bridge.InventoryName
+end
+
 function Bridge.Init()
     -- Detect framework
     for _, fw in ipairs(Frameworks) do
@@ -33,14 +55,7 @@ function Bridge.Init()
         end
     end
 
-    -- Detect inventory
-    for _, inv in ipairs(Inventories) do
-        if GetResourceState(inv.resource) == "started" then
-            Bridge.InventoryName = inv.name
-            Bridge.InventoryResource = inv.resource
-            break
-        end
-    end
+    Bridge.DetectInventory()
 
     -- Detect SQL
     for _, sql in ipairs(SQLScripts) do
@@ -57,6 +72,16 @@ function Bridge.Init()
     print(("^3  Inventory: %s^0"):format(Bridge.InventoryName or "Not found"))
     print(("^3  SQL: %s^0"):format(Bridge.SQLName or "Not found"))
 end
+
+-- Envanter bridge'den SONRA baslar (dependency). Init sirasinda kapali gorunuyorsa
+-- kaynak acildiginda tespiti tekrarla; yoksa InventoryName nil kalir ve bridge'in
+-- item exportlari (AddItem/RemoveItem/GetInventory) hicbir dala girmez.
+AddEventHandler(IsDuplicityVersion() and 'onResourceStart' or 'onClientResourceStart', function(res)
+    if res == currentResourceName or Bridge.InventoryName then return end
+    if Bridge.DetectInventory() then
+        print(("^3[gfxr-bridge] Inventory: %s (%s gec basladi)^0"):format(Bridge.InventoryName, res))
+    end
+end)
 
 --- Get the raw framework object
 ---@return any
