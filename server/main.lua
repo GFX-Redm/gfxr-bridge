@@ -70,7 +70,10 @@ exports('GetIdentifier', function(source)
             local user = core.getUser(source)
             if user then
                 local char = user.getUsedCharacter
-                return char and char.identifier or nil
+                -- VORP'ta `identifier` HESAP (steam:...), `charIdentifier` KARAKTER kimligi.
+                -- Karakter bazli olmali: aksi halde ayni hesabin tum karakterleri envanteri,
+                -- postayi vb. paylasir ve migrasyon anahtarlari (player:<charidentifier>) tutmaz.
+                return char and char.charIdentifier and tostring(char.charIdentifier) or nil
             end
         end
     elseif Bridge.FrameworkName == "rsg" then
