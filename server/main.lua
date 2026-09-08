@@ -100,6 +100,49 @@ end)
 --- Get player display name
 ---@param source number
 ---@return string
+--- Framework'un KENDI diriltmesi.
+---
+--- Native `NetworkResurrectLocalPlayer` ped'i ayaga kaldirir ama olum durumu/kamerasi
+--- framework tarafinda tutuldugu icin acik kalir (VORP: oyuncu diriliyor, kamera ceset
+--- kamerasinda kaliyor). gfxr-admin once bunu cagirir, `false` donerse native yola duser.
+---
+--- Donus: true = framework diriltti, cagiranin ayrica bir sey yapmasina gerek yok.
+---@param source number
+---@return boolean
+exports('Revive', function(source)
+    if not source then return false end
+
+    if Bridge.FrameworkName == "vorp" then
+        local core = GetCore()
+        if core and core.Player and core.Player.Revive then
+            core.Player.Revive(source)
+            return true
+        end
+        -- Cekirdek API degisirse olay yolu (vorp_core/server/apicontroller.lua:211-215).
+        TriggerEvent("vorp_core:Server:OnPlayerRevive", source)
+        TriggerClientEvent("vorp_core:Client:OnPlayerRevive", source)
+        return true
+
+    elseif Bridge.FrameworkName == "rsg" then
+        -- ⚠️ DOGRULANMADI (elimizde RSG kurulumu yok). Olay adi yanlissa hicbir sey
+        -- olmaz; bilerek `false` donuyoruz ki cagiran native diriltmeyi de yapsin.
+        -- Ikisini birden calistirmak zararsiz: native, olu olmayan ped'de is yapmaz.
+        if GetResourceState('rsg-medic') == 'started' then
+            TriggerClientEvent('rsg-medic:client:playerRevive', source)
+        end
+        return false
+
+    elseif Bridge.FrameworkName == "redem" then
+        -- ⚠️ DOGRULANMADI, yukaridaki ile ayni mantik.
+        if GetResourceState('redemrp_respawn') == 'started' then
+            TriggerClientEvent('redemrp_respawn:Revive', source)
+        end
+        return false
+    end
+
+    return false
+end)
+
 exports('GetPlayerName', function(source)
     if Bridge.FrameworkName == "vorp" or Bridge.FrameworkName == "redem" then
         local player = exports['gfxr-bridge']:GetPlayer(source)
