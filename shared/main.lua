@@ -78,9 +78,33 @@ end
 -- item exportlari (AddItem/RemoveItem/GetInventory) hicbir dala girmez.
 AddEventHandler(IsDuplicityVersion() and 'onResourceStart' or 'onClientResourceStart', function(res)
     if res == currentResourceName or Bridge.InventoryName then return end
-    if Bridge.DetectInventory() then
-        print(("^3[gfxr-bridge] Inventory: %s (%s gec basladi)^0"):format(Bridge.InventoryName, res))
+    -- ⚠️ Olay tetiklendiginde kaynagin durumu HENUZ 'started' olmayabiliyor;
+    -- ayni karede GetResourceState 'starting' donuyor ve tespit bos donuyordu.
+    -- Bir kare bekleyip tekrar bakiyoruz.
+    CreateThread(function()
+        Wait(0)
+        if Bridge.InventoryName then return end
+        if Bridge.DetectInventory() then
+            print(("^3[gfxr-bridge] Inventory: %s (%s gec basladi)^0"):format(Bridge.InventoryName, res))
+        end
+    end)
+end)
+
+-- ⚠️ SON CARE: envanter tespiti KACIRILIRSA bridge'in item export'lari (AddItem,
+-- RemoveItem, GetInventory...) hicbir dala girmez ve sessizce bos doner —
+-- panelde "oyuncunun envanteri bos" gorunur, hicbir hata da yazilmaz. Olay
+-- kancasina guvenmek yetmiyor (kaynak sirasi, ge basla, restart), bu yuzden
+-- acilistan sonra 30 saniye boyunca tespit tekrar denenir.
+CreateThread(function()
+    for _ = 1, 60 do
+        if Bridge.InventoryName then return end
+        Wait(500)
+        if Bridge.DetectInventory() then
+            print(("^3[gfxr-bridge] Inventory: %s (gec tespit)^0"):format(Bridge.InventoryName))
+            return
+        end
     end
+    print("^1[gfxr-bridge] Inventory: tespit edilemedi — item export'lari bos donecek.^0")
 end)
 
 --- Get the raw framework object
