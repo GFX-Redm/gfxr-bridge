@@ -60,6 +60,46 @@ exports('IsAdmin', function(source)
     return false
 end)
 
+--- The player's PERMISSION GROUP as the framework itself stores it.
+---
+--- VORP keeps two: the ACCOUNT group (`users.group`, what vorp_admin reads by
+--- default) and the CHARACTER group (`characters.group`, vorp_admin's
+--- `UseCharactersAdmin = true` mode). `useCharacter` picks between them; the
+--- other frameworks only have one, so the flag is ignored there.
+---
+--- ⚠️ Kept separate from `IsAdmin`: that one answers "may this player do admin
+--- things at all", this one returns the RAW group so a caller can map it to its
+--- own role table (gfxr-admin does exactly that).
+---@param source number
+---@param useCharacter boolean|nil VORP only: read the character group instead of the account group
+---@return string|nil
+exports('GetGroup', function(source, useCharacter)
+    if not source or source == 0 then return nil end
+
+    if Bridge.FrameworkName == "vorp" then
+        local core = GetCore()
+        if not core then return nil end
+        local user = core.getUser(source)
+        if not user then return nil end
+        if useCharacter then
+            local char = user.getUsedCharacter
+            return char and char.group or nil
+        end
+        return user.getGroup
+    elseif Bridge.FrameworkName == "rsg" then
+        local core = GetCore()
+        if not core then return nil end
+        local player = core.Functions.GetPlayer(source)
+        if not player or not player.PlayerData then return nil end
+        return player.PlayerData.group
+            or (player.PlayerData.metadata and player.PlayerData.metadata.group)
+    elseif Bridge.FrameworkName == "redem" then
+        local player = exports.redemrp:getPlayerFromId(source)
+        return player and (player.group or (player.getGroup and player.getGroup())) or nil
+    end
+    return nil
+end)
+
 --- Get player identifier (citizenid / charid / identifier)
 ---@param source number
 ---@return string|nil
@@ -342,6 +382,764 @@ exports('AddItem', function(source, item, count, meta)
     end
 end)
 
+--- ══════════════════════════════════════════════════════════════════
+--- ENVANTER ISTATISTIKLERI (SUNUCU GENELI)
+---
+--- ⚠️ TEK EXPORT, `kind` ile dallanir. Bunlar ayni tablo ailesi uzerinde
+--- ayni framework dalini paylasan dort sorgu; dort ayri export yazmak ayni
+--- "hangi framework" merdivenini dort kez kopyalamak demekti.
+---
+--- kind:
+---   'summary'  -> { items, stacks, distinct, players, stashes }
+---   'items'    -> { { name, total, holders }, ... }        (params.search)
+---   'players'  -> { { owner, name, total, distinct }, ... }
+---   'stashes'  -> { { stash, total, distinct }, ... }
+---   'holders'  -> { { owner, name, total }, ... }          (params.item)
+---
+--- ⚠️ VARSAYIMLARINI KENDI DOGRULAR. RSG kurulumunun envanter semasini
+--- yerinde goremedim; kod once tablonun VAR OLUP OLMADIGINI sorar ve yoksa
+--- `nil` doner. Uydurulmus bir sorguyu calistirmak konsola kirmizi hata
+--- basar ve panelde sessizce sifir gosterirdi.
+--- ══════════════════════════════════════════════════════════════════
+
+--- Bir tablo bu veritabaninda var mi?
+---@param name string
+---@return boolean
+local function tableExists(name)
+    local rows = exports['gfxr-bridge']:ExecuteSql(
+        'SELECT COUNT(*) AS c FROM information_schema.TABLES' ..
+        ' WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?', { name })
+    return rows ~= nil and rows[1] ~= nil and (tonumber(rows[1].c) or 0) > 0
+end
+
+--- VORP: character_inventories(character_id, amount, inventory_type, item_name)
+--- `inventory_type = 'default'` oyuncunun kendi envanteri, digerleri depo.
+---@param kind string
+---@param params table
+---@return table|nil
+local function vorpInventoryStats(kind, params)
+    local limit = math.floor(tonumber(params.limit) or 50)
+    local offset = math.floor(tonumber(params.offset) or 0)
+    local CI = '`character_inventories`'
+
+    if kind == "summary" then
+        local rows = exports['gfxr-bridge']:ExecuteSql(
+            'SELECT SUM(amount) AS items, COUNT(*) AS stacks,' ..
+            ' COUNT(DISTINCT item_name) AS distinctItems,' ..
+            " COUNT(DISTINCT CASE WHEN inventory_type = 'default' THEN character_id END) AS players," ..
+            " COUNT(DISTINCT CASE WHEN inventory_type <> 'default' THEN inventory_type END) AS stashes" ..
+            ' FROM ' .. CI)
+        local row = rows and rows[1]
+        if not row then return nil end
+        return {
+            items    = tonumber(row.items) or 0,
+            stacks   = tonumber(row.stacks) or 0,
+            distinct = tonumber(row.distinctItems) or 0,
+            players  = tonumber(row.players) or 0,
+            stashes  = tonumber(row.stashes) or 0,
+        }
+
+    elseif kind == "items" then
+        local search = params.search
+        local rows
+        if type(search) == "string" and search ~= "" then
+            rows = exports['gfxr-bridge']:ExecuteSql(
+                'SELECT item_name AS name, SUM(amount) AS total,' ..
+                ' COUNT(DISTINCT character_id) AS holders FROM ' .. CI ..
+                ' WHERE item_name LIKE ? GROUP BY item_name ORDER BY total DESC LIMIT ? OFFSET ?',
+                { "%" .. search .. "%", limit, offset })
+        else
+            rows = exports['gfxr-bridge']:ExecuteSql(
+                'SELECT item_name AS name, SUM(amount) AS total,' ..
+                ' COUNT(DISTINCT character_id) AS holders FROM ' .. CI ..
+                ' GROUP BY item_name ORDER BY total DESC LIMIT ? OFFSET ?', { limit, offset })
+        end
+        local out = {}
+        for _, row in pairs(rows or {}) do
+            out[#out + 1] = { name = row.name, total = tonumber(row.total) or 0,
+                              holders = tonumber(row.holders) or 0 }
+        end
+        return out
+
+    elseif kind == "players" then
+        -- ⚠️ `identifier` de dondurulur: `character_id` VORP'un KARAKTER
+        -- kimligi, panelin oyuncu profili ise oyuncunun hesap kimligini
+        -- bekliyor. Ikisini birbirine baglayan tek sutun bu.
+        local rows = exports['gfxr-bridge']:ExecuteSql(
+            'SELECT ci.character_id AS owner, SUM(ci.amount) AS total,' ..
+            ' COUNT(DISTINCT ci.item_name) AS distinctItems,' ..
+            ' c.identifier AS identifier,' ..
+            " CONCAT(COALESCE(c.firstname,''), ' ', COALESCE(c.lastname,'')) AS name" ..
+            ' FROM ' .. CI .. ' ci' ..
+            ' LEFT JOIN `characters` c ON c.charidentifier = ci.character_id' ..
+            " WHERE ci.inventory_type = 'default'" ..
+            ' GROUP BY ci.character_id, name, identifier ORDER BY total DESC LIMIT ? OFFSET ?',
+            { limit, offset })
+        local out = {}
+        for _, row in pairs(rows or {}) do
+            out[#out + 1] = {
+                owner = tostring(row.owner), name = row.name,
+                identifier = row.identifier,
+                total = tonumber(row.total) or 0,
+                distinct = tonumber(row.distinctItems) or 0,
+            }
+        end
+        return out
+
+    elseif kind == "stashes" then
+        -- ⚠️ VORP'ta deponun "sahibi" diye bir sutun YOK: `inventory_type`
+        -- onu kaydeden scriptin verdigi serbest bir kimlik. Sahiplik
+        -- uydurmak yerine ICINE EN COK KOYAN karakteri gosteriyoruz —
+        -- bu gercekten tabloda duran bir bilgi.
+        local rows = exports['gfxr-bridge']:ExecuteSql(
+            'SELECT ci.inventory_type AS stash, SUM(ci.amount) AS total,' ..
+            ' COUNT(DISTINCT ci.item_name) AS distinctItems,' ..
+            ' COUNT(DISTINCT ci.character_id) AS contributors' ..
+            ' FROM ' .. CI .. ' ci' ..
+            " WHERE ci.inventory_type <> 'default'" ..
+            ' GROUP BY ci.inventory_type ORDER BY total DESC LIMIT ? OFFSET ?',
+            { limit, offset })
+        local out = {}
+        for _, row in pairs(rows or {}) do
+            out[#out + 1] = {
+                stash = row.stash, total = tonumber(row.total) or 0,
+                distinct = tonumber(row.distinctItems) or 0,
+                contributors = tonumber(row.contributors) or 0,
+            }
+        end
+        return out
+
+    elseif kind == "holders" then
+        local item = params.item
+        if type(item) ~= "string" or item == "" then return {} end
+        local rows = exports['gfxr-bridge']:ExecuteSql(
+            'SELECT ci.character_id AS owner, ci.inventory_type AS stash,' ..
+            ' SUM(ci.amount) AS total, c.identifier AS identifier,' ..
+            " CONCAT(COALESCE(c.firstname,''), ' ', COALESCE(c.lastname,'')) AS name" ..
+            ' FROM ' .. CI .. ' ci' ..
+            ' LEFT JOIN `characters` c ON c.charidentifier = ci.character_id' ..
+            ' WHERE ci.item_name = ?' ..
+            ' GROUP BY ci.character_id, ci.inventory_type, name, identifier ORDER BY total DESC LIMIT ?',
+            { item, limit })
+        local out = {}
+        for _, row in pairs(rows or {}) do
+            out[#out + 1] = {
+                owner = tostring(row.owner), name = row.name,
+                identifier = row.identifier,
+                stash = row.stash ~= "default" and row.stash or nil,
+                total = tonumber(row.total) or 0,
+            }
+        end
+        return out
+    end
+
+    return nil
+end
+
+--- Server-wide inventory statistics.
+---@param kind string 'summary'|'items'|'players'|'stashes'|'holders'
+---@param params table|nil
+---@return table|nil nil when the framework/inventory is not supported
+exports('GetInventoryStats', function(kind, params)
+    params = type(params) == "table" and params or {}
+
+    if Bridge.FrameworkName == "vorp" then
+        if not tableExists("character_inventories") then return nil end
+        return vorpInventoryStats(kind, params)
+    end
+
+    -- ⚠️ RSG/RedEM: envanter semasini yerinde DOGRULAYAMADIM. RSG'de esyalar
+    -- `players.inventory` JSON sutununda ve depolar `stashitems` tablosunda
+    -- durur; MySQL JSON toplamayla bunlari toplamak mumkun ama sema
+    -- kurulumdan kuruluma degisiyor. Dogrulanmamis bir sorgu calistirmak
+    -- konsola kirmizi hata basar ve panelde sessizce sifir gosterirdi —
+    -- panel bunun yerine "desteklenmiyor" diyor.
+    return nil
+end)
+
+--- ══════════════════════════════════════════════════════════════════
+--- EKONOMI TOPLAMLARI (SUNUCU GENELI)
+---
+--- ⚠️ BAGLI OYUNCULARIN degil, TUM KARAKTERLERIN toplami. Bagli olanlari
+--- toplamak gece 3'te "sunucuda 40 dolar var" derdi; bu sayinin tek anlamli
+--- hali veritabanindaki butun karakterleri kapsamasi.
+---
+--- ⚠️ Para turleri SABIT DEGIL: RSG'de sunucu sahibi kendi turunu ekleyebiliyor
+--- (`RSGConfig.Money.MoneyTypes`) ve para tek bir JSON sutununda duruyor.
+--- Sabit bir "cash + bank" listesi yazmak, o sunucularin parasinin bir
+--- kismini gorunmez kilardi — tur listesini CALISMA ZAMANINDA okuyoruz.
+--- ══════════════════════════════════════════════════════════════════
+
+--- Server-wide money totals across every character.
+---@return table|nil { [moneyType] = total, ... } plus `characters` count
+exports('GetEconomyTotals', function()
+    if Bridge.FrameworkName == "vorp" then
+        local rows = exports['gfxr-bridge']:ExecuteSql(
+            'SELECT COUNT(*) AS chars, SUM(`money`) AS cash, SUM(`gold`) AS gold, SUM(`rol`) AS rol FROM `characters`')
+        local row = rows and rows[1]
+        if not row then return nil end
+        return {
+            characters = tonumber(row.chars) or 0,
+            totals     = {
+                cash = tonumber(row.cash) or 0.0,
+                gold = tonumber(row.gold) or 0.0,
+                rol  = tonumber(row.rol) or 0.0,
+            },
+        }
+
+    elseif Bridge.FrameworkName == "rsg" then
+        local core = GetCore()
+        local types = core and core.Config and core.Config.Money
+            and core.Config.Money.MoneyTypes or { cash = 0, bank = 0 }
+
+        -- Tur adlari sunucu yapilandirmasindan geliyor; SQL'e gomulmeden ONCE
+        -- suzuluyor. Yapilandirma dosyasi guvenilir kabul edilse de bir
+        -- sutun adi enjeksiyonu icin acik birakmak gereksiz bir risk.
+        local keys = {}
+        for name in pairs(types) do
+            if type(name) == "string" and name:match("^[%w_]+$") then
+                keys[#keys + 1] = name
+            end
+        end
+        table.sort(keys)
+        if #keys == 0 then return nil end
+
+        local parts = { 'COUNT(*) AS chars' }
+        for _, name in ipairs(keys) do
+            parts[#parts + 1] = ("SUM(JSON_EXTRACT(`money`, '$.%s')) AS `%s`"):format(name, name)
+        end
+
+        local rows = exports['gfxr-bridge']:ExecuteSql(
+            'SELECT ' .. table.concat(parts, ', ') .. ' FROM `players`')
+        local row = rows and rows[1]
+        if not row then return nil end
+
+        local totals = {}
+        for _, name in ipairs(keys) do
+            totals[name] = tonumber(row[name]) or 0.0
+        end
+        return { characters = tonumber(row.chars) or 0, totals = totals }
+    end
+
+    -- RedEM: karakter tablosunun semasi dogrulanmadi; uydurma bir sorgu
+    -- hata basar ve panelde sifir gosterirdi.
+    return nil
+end)
+
+--- Sunucuda KULLANIMDA olan meslek adlari.
+---
+--- ⚠️ FRAMEWORK'LERDE MERKEZI BIR MESLEK LISTESI YOK (VORP'ta yok; meslek
+--- karakter satirinda serbest metin). O yuzden burada dondurulen sey
+--- "tanimli meslekler" degil, GERCEKTEN ATANMIS olanlardir. Panel bunu
+--- sunucu sahibinin config listesiyle birlestirir: henuz kimseye verilmemis
+--- bir meslek yalnizca config'ten gelir.
+---
+--- ⚠️ RSG'de kaynak SQL DEGIL, `RSGCore.Shared.Jobs` tablosudur — meslekler
+--- orada tanimli ve etiketleriyle birlikte gelir.
+---@return table<string,string>|nil  { [ad] = etiket } ; framework bilinmiyorsa nil
+exports('GetJobs', function()
+    if Bridge.FrameworkName == "vorp" then
+        local out = {}
+
+        -- ⚠️ BIRINCIL KAYNAK: vorp_core'un KAYIT DEFTERI. VORP scriptleri
+        -- mesleklerini calisma aninda buraya kaydediyor (config/jobs.lua yalnizca
+        -- elle eklenenler icin). vorp_core bu okumayi acikca admin scriptleri
+        -- icin sunuyor — kendi yorumu: "to get it into your admin scripts".
+        --
+        -- Bu olmadan liste yalnizca ATANMIS mesleklerden kuruluyordu: tek bir
+        -- oyuncuya sheriff verilmis bir sunucuda acilir kutuda yalnizca
+        -- "sheriff" gorunuyordu, digerleri hic secilemiyordu.
+        -- ⚠️ TIP KONTROLU YAPMA. `core.GetRegisteredJobs` kaynaklar arasi bir
+        -- FONKSIYON REFERANSI ve FiveM onu bir tabloya sariyor:
+        --     type(core.GetRegisteredJobs) == 'table'
+        --     tostring -> { __cfx_functionReference = "vorp_core:..." }
+        -- Yani `type(...) == 'function'` kontrolu HER ZAMAN basarisiz olur ve
+        -- kayit defteri hic okunmaz (olculdu: liste yalnizca karakter
+        -- tablosundan gelen tek meslegi gosteriyordu). Dogru yol cagirip
+        -- sonuca bakmak.
+        local ok, core = pcall(function() return exports.vorp_core:GetCore() end)
+        if ok and type(core) == 'table' then
+            local okJobs, jobs = pcall(function() return core.GetRegisteredJobs() end)
+            if okJobs and type(jobs) == 'table' then
+                for name, def in pairs(jobs) do
+                    -- ⚠️ VORP'UN KENDI ORNEK KAYDI ELENIYOR. vorp_core kutudan
+                    -- `config/jobs.lua` icinde bir ORNEK meslekle geliyor ve o
+                    -- ornegin isareti `RESOURCE = "my_script"`. Kayit defterine
+                    -- girdigi icin panelde gercek meslegin yaninda ikinci bir
+                    -- kayit olarak gorunuyordu (`vorp_police` -> "Police" ve
+                    -- ornek -> "police"); yetkili yanlis olani secerse hicbir
+                    -- scriptin tanimadigi bir meslek atanmis olurdu.
+                    --
+                    -- ⚠️ COZUM SUNUCU SAHIBININ DOSYASINI DUZENLEMEK DEGIL:
+                    -- bu kayit VORP ile birlikte geliyor, yani HER kurulumda
+                    -- var. Alicidan kendi paketini degistirmesini istemek
+                    -- yerine burada eleniyor. "my_script" VORP'un kendi
+                    -- ornek isareti, uydurma bir eslesme degil.
+                    local placeholder = type(def) == 'table' and def.RESOURCE == 'my_script'
+                    if type(name) == 'string' and name ~= '' and not placeholder then
+                        out[name] = name
+                    end
+                end
+            end
+        end
+
+        -- ⚠️ IKINCIL: kullanimda olup KAYITLI OLMAYANLAR. Elle veya eski bir
+        -- script tarafindan verilmis bir meslek defterde olmayabilir; listede
+        -- gorunmezse yetkili onu bir daha atayamaz.
+        local rows = exports['gfxr-bridge']:ExecuteSql(
+            "SELECT DISTINCT `job` FROM `characters` WHERE `job` IS NOT NULL AND `job` <> ''")
+        for _, row in ipairs(rows or {}) do
+            if type(row.job) == 'string' and row.job ~= '' and out[row.job] == nil then
+                out[row.job] = row.job
+            end
+        end
+
+        -- ⚠️ ISSIZ HER ZAMAN LISTEDE. VORP'un varsayilan meslegi
+        -- (`config.lua` -> initJob = "unemployed") kayit defterine GIRMIYOR:
+        -- hicbir script onu kaydetmiyor, yeni oyuncuya dogrudan atanıyor.
+        -- Listeye elle eklenmezse yetkili birinin meslegini ALAMAZ — meslek
+        -- vermek mumkun, geri almak degil. Zaten varsa uzerine yazmiyoruz.
+        if out['unemployed'] == nil then out['unemployed'] = 'unemployed' end
+
+        return out
+
+    elseif Bridge.FrameworkName == "rsg" then
+        -- ⚠️ RSG'de kaynak SQL DEGIL, cekirdegin paylasilan tablosu.
+        -- `core.Shared.Jobs` bir VERI tablosu (fonksiyon degil), o yuzden
+        -- kaynaklar arasi sorunsuz geciyor — VORP'taki fonksiyon referansi
+        -- tuzagi burada yok.
+        local core = GetCore()
+        local jobs = core and core.Shared and core.Shared.Jobs
+        if type(jobs) ~= 'table' then return nil end
+
+        local out = {}
+        for name, def in pairs(jobs) do
+            out[name] = (type(def) == 'table' and def.label) or name
+        end
+
+        -- RSG'nin varsayilan meslegi de 'unemployed' ve o da Shared.Jobs
+        -- icinde tanimli OLMAYABILIR; ayni gerekce.
+        if out['unemployed'] == nil then out['unemployed'] = 'unemployed' end
+        return out
+    end
+
+    -- RedEM: meslek semasi dogrulanmadi; uydurma bir sorgu hata basar ve
+    -- panelde bos bir liste gosterirdi. Bilmiyorsak nil demek dogrusu.
+    return nil
+end)
+
+--- ══════════════════════════════════════════════════════════════════
+--- KARAKTER (isim, yas, takma ad, aciklama, XP)
+---
+--- ⚠️ ALAN KUMESI FRAMEWORK'E GORE DEGISIR ve `editable` bunu ACIKCA
+--- bildirir. Cagiran taraf kendi listesini varsaymaz: RSG'de takma ad ve
+--- karakter aciklamasi YOK, VORP'ta dogum tarihi yok (yas var). Desteklenmeyen
+--- bir alani yine de gostermek, kullanicinin doldurup kaydettigi ve HICBIR
+--- SEY OLMAYAN bir kutu demekti.
+---
+---   VORP  : Character.Firstname/Lastname/NickName/Age/Gender/
+---           CharDescription/Xp + SaveCharacterInDb()
+---   RSG   : PlayerData.charinfo (firstname/lastname/birthdate/gender)
+---           + SetPlayerData + Save()
+---   RedEM : yalnizca OKUNUR — yazma API'si dogrulanamadi, uydurmak
+---           sessizce kaybolan bir "kaydet" dugmesi uretirdi.
+--- ══════════════════════════════════════════════════════════════════
+
+--- VORP erisimcisi guvenli cagri.
+---
+--- ⚠️ pcall SART: vorp_core'un RemoveXp yolu `self.Xp` FONKSIYONUNU bir
+--- SAYIYLA eziyor (character.lua "self.Xp = self.xp - quantity"). O karakterde
+--- `player.Xp(value)` cagrisi "attempt to call a number" ile patlar; bu yuzden
+--- erisimci calismazsa ham alana yaziyoruz — SaveCharacterInDb zaten ham
+--- alani okur.
+---@param player table
+---@param accessor string
+---@param rawField string
+---@param value any
+local function vorpSet(player, accessor, rawField, value)
+    local fn = player[accessor]
+    if type(fn) == "function" then
+        local ok = pcall(fn, value)
+        if ok then return true end
+    end
+    player[rawField] = value
+    return true
+end
+
+--- Read a player's character sheet.
+---@param source number
+---@return table|nil { fields = table, editable = string[] }
+exports('GetCharacter', function(source)
+    local player = exports['gfxr-bridge']:GetPlayer(source)
+    if not player then return nil end
+
+    if Bridge.FrameworkName == "vorp" then
+        return {
+            fields = {
+                firstname   = player.firstname,
+                lastname    = player.lastname,
+                nickname    = player.nickname,
+                age         = tonumber(player.age),
+                gender      = player.gender,
+                description = player.charDescription,
+                xp          = tonumber(player.xp) or 0,
+            },
+            editable = { "firstname", "lastname", "nickname", "age", "gender", "description", "xp" },
+        }
+    elseif Bridge.FrameworkName == "rsg" then
+        local ci = player.PlayerData and player.PlayerData.charinfo or {}
+        return {
+            fields = {
+                firstname = ci.firstname,
+                lastname  = ci.lastname,
+                birthdate = ci.birthdate,
+                -- RSG cinsiyeti sayi tutar (0/1); panel metin bekliyor.
+                gender    = tostring(ci.gender or 0),
+            },
+            editable = { "firstname", "lastname", "birthdate", "gender" },
+        }
+    elseif Bridge.FrameworkName == "redem" then
+        return {
+            fields   = { firstname = player.firstname, lastname = player.lastname },
+            editable = {},   -- yazma API'si dogrulanmadi
+        }
+    end
+    return nil
+end)
+
+--- Write character fields. Only supported keys are applied.
+---@param source number
+---@param fields table
+---@return boolean ok, table applied
+exports('SetCharacter', function(source, fields)
+    if type(fields) ~= "table" then return false, {} end
+
+    local player = exports['gfxr-bridge']:GetPlayer(source)
+    if not player then return false, {} end
+
+    local applied = {}
+
+    if Bridge.FrameworkName == "vorp" then
+        local MAP = {
+            firstname   = { "Firstname", "firstname" },
+            lastname    = { "Lastname", "lastname" },
+            nickname    = { "NickName", "nickname" },
+            age         = { "Age", "age" },
+            gender      = { "Gender", "gender" },
+            description = { "CharDescription", "charDescription" },
+            xp          = { "Xp", "xp" },
+        }
+        for key, target in pairs(MAP) do
+            local value = fields[key]
+            if value ~= nil then
+                vorpSet(player, target[1], target[2], value)
+                applied[#applied + 1] = key
+            end
+        end
+        if #applied > 0 and type(player.SaveCharacterInDb) == "function" then
+            player.SaveCharacterInDb()
+        end
+        return #applied > 0, applied
+
+    elseif Bridge.FrameworkName == "rsg" then
+        local ci = player.PlayerData and player.PlayerData.charinfo
+        if not ci then return false, {} end
+
+        for _, key in ipairs({ "firstname", "lastname", "birthdate", "gender" }) do
+            if fields[key] ~= nil then
+                -- Cinsiyet RSG'de SAYI: metin yazmak karakter olusturma
+                -- ekranini ve kiyafet scriptlerini bozar.
+                ci[key] = (key == "gender") and (tonumber(fields[key]) or 0) or fields[key]
+                applied[#applied + 1] = key
+            end
+        end
+
+        if #applied > 0 then
+            player.Functions.SetPlayerData("charinfo", ci)
+            player.Functions.Save()
+        end
+        return #applied > 0, applied
+    end
+
+    -- RedEM ve bilinmeyen framework: yazma yok.
+    return false, {}
+end)
+
+--- ══════════════════════════════════════════════════════════════════
+--- WHITELIST
+---
+--- ⚠️ YALNIZCA FRAMEWORK'UN KENDI whitelist'i. Bir framework whitelist
+--- kavramini tasimiyorsa burasi `false` doner ve cagiran taraf kendi
+--- listesini kurar — koprunun isi olmayan bir kavrami TAKLIT ETMEK,
+--- sunucunun gercek whitelist'i yaninda ikinci bir dogruluk kaynagi
+--- yaratirdi.
+---
+---   VORP  : `whitelist` tablosu + `Core.Whitelist` API'si (vorp_core
+---           baglanti aninda kendisi zorluyor).
+---   RSG   : whitelist kavrami YOK.
+---   RedEM : whitelist kavrami YOK.
+--- ══════════════════════════════════════════════════════════════════
+
+--- Does the running framework have its own whitelist?
+---@return boolean
+exports('WhitelistSupported', function()
+    return Bridge.FrameworkName == "vorp"
+end)
+
+--- List whitelist entries (framework table).
+---@param search string|nil
+---@param limit number|nil
+---@param offset number|nil
+---@return table rows { { identifier, status, discord, firstConnection }, ... }
+exports('WhitelistList', function(search, limit, offset)
+    if Bridge.FrameworkName ~= "vorp" then return {} end
+
+    limit = math.floor(tonumber(limit) or 50)
+    offset = math.floor(tonumber(offset) or 0)
+
+    local rows
+    if type(search) == "string" and search ~= "" then
+        local like = "%" .. search .. "%"
+        rows = exports['gfxr-bridge']:ExecuteSql(
+            'SELECT identifier, status, discordid, firstconnection FROM `whitelist`' ..
+            ' WHERE identifier LIKE ? OR discordid LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?',
+            { like, like, limit, offset })
+    else
+        rows = exports['gfxr-bridge']:ExecuteSql(
+            'SELECT identifier, status, discordid, firstconnection FROM `whitelist`' ..
+            ' ORDER BY id DESC LIMIT ? OFFSET ?', { limit, offset })
+    end
+
+    local out = {}
+    for _, row in pairs(rows or {}) do
+        out[#out + 1] = {
+            identifier      = row.identifier,
+            -- ⚠️ oxmysql TINYINT(1)'i BOOLEAN olarak dondurebiliyor; iki
+            -- bicimi de kabul ediyoruz (bkz. gfxr-admin SqlBool dersi).
+            status          = row.status == true or tonumber(row.status) == 1,
+            discord         = row.discordid,
+            firstConnection = row.firstconnection == true or tonumber(row.firstconnection) == 1,
+        }
+    end
+    return out
+end)
+
+--- Whitelist / un-whitelist one identifier.
+---@param identifier string
+---@param status boolean
+---@return boolean handled
+--- Framework whitelist'i GERCEKTEN zorluyor mu?
+---
+--- ⚠️ NEDEN GEREKLI: VORP'un whitelist tablosu HER ZAMAN var, ama vorp_core
+--- ona yalnizca kendi `Config.Whitelist` acikken bakiyor. Kapaliyken tablo
+--- doluyor, panel "framework whitelist" diyor, yonetici kisi ekliyor —
+--- ve sunucu HERKESE acik kalmaya devam ediyor. Hicbir yerde hata yok;
+--- koruma oldugu SANILAN bir sey hic yok. Panelin bunu soyleyebilmesi icin
+--- durumu okuyabilmesi gerekiyor.
+---
+--- ⚠️ SALT OKUMA. vorp_core'un dosyasi OKUNUR, degistirilmez: musterinin
+--- kendi paketinde hicbir degisiklik yapilmadan calismak zorundayiz.
+---
+--- ⚠️ Bulunamazsa `nil` doner — `false` DEGIL. "Bilmiyorum" ile "kapali"
+--- ayni sey degil; panel bilinmeyen durumda yanlis bir guvence de,
+--- yanlis bir alarm da vermemeli.
+---@return boolean|nil
+exports('WhitelistEnforced', function()
+    if Bridge.FrameworkName ~= "vorp" then return nil end
+
+    local text = LoadResourceFile('vorp_core', 'config/config.lua')
+    if type(text) ~= "string" or text == "" then return nil end
+
+    -- Yorum satirlarini ele: "-- Whitelist = true" ornegi degeri bozardi.
+    for line in text:gmatch("[^\r\n]+") do
+        local body = line:match("^%s*(.-)%s*$")
+        if not body:match("^%-%-") then
+            local value = body:match("^Whitelist%s*=%s*([%a]+)")
+                or body:match("^Config%.Whitelist%s*=%s*([%a]+)")
+            if value then return value == "true" end
+        end
+    end
+    return nil
+end)
+
+--- Framework whitelist'in ANAHTAR OLARAK kullandigi kimlik turu.
+---
+--- ⚠️ Onemli: vorp_core whitelist'i STEAM kimligiyle ariyor
+--- (`GetPlayerIdentifierByType(src, 'steam')`). Listeye `license:...` yazmak
+--- sessizce ise yaramaz — satir tabloya girer, eslesme HIC olmaz. Panel
+--- ekleme alaninda bunu soyleyebilsin diye bildiriliyor.
+---@return string|nil
+exports('WhitelistIdentityKind', function()
+    if Bridge.FrameworkName ~= "vorp" then return nil end
+    return "steam"
+end)
+
+exports('WhitelistSet', function(identifier, status)
+    if Bridge.FrameworkName ~= "vorp" then return false end
+    if type(identifier) ~= "string" or identifier == "" then return false end
+
+    local core = GetCore()
+    if not core or not core.Whitelist then return false end
+
+    if status then
+        core.Whitelist.whitelistUser(identifier)
+    else
+        core.Whitelist.unWhitelistUser(identifier)
+    end
+    return true
+end)
+
+--- ══════════════════════════════════════════════════════════════════
+--- ITEM CATALOG
+---
+--- ⚠️ FRAMEWORKLER BUNU AYNI YERDE TUTMUYOR — tek bir yaklasim ise yaramaz:
+---   * VORP  : VERITABANINDA. `vorp_inventory` acilista `SELECT * FROM items`
+---             cekiyor (server/services/itemsDatabase.lua). Sutunlar:
+---             item, label, limit, type, usable, can_remove, metadata.
+---   * RSG   : LUA TABLOSUNDA. `rsg-core/shared/items.lua` -> `RSGShared.Items`
+---             (Core.Shared.Items). Veritabaniyla ilgisi yok.
+---   * RedEM : envanter kaynagina gore degisiyor; DB'de `items` tablosu
+---             varsayiliyor, yoksa bos donuyor.
+---
+--- ⚠️ Sonuc ONBELLEKLENIR. VORP tarafi SQL turu; katalog 500+ satir olabiliyor
+--- ve bir arama kutusu her tusa basista bunu cekemez.
+--- ══════════════════════════════════════════════════════════════════
+
+local itemCatalog = nil
+
+--- Every item DEFINED on the server (not a player's inventory).
+---@param refresh boolean|nil rebuild the cache
+---@return table rows { { name, label }, ... }  (never nil)
+exports('GetItemCatalog', function(refresh)
+    if itemCatalog and not refresh then return itemCatalog end
+
+    local out = {}
+
+    if Bridge.FrameworkName == "rsg" then
+        local core = GetCore()
+        local shared = core and core.Shared or nil
+        for key, item in pairs((shared and shared.Items) or {}) do
+            local name = item.name or key
+            if type(name) == "string" and name ~= "" then
+                out[#out + 1] = { name = name, label = item.label or name }
+            end
+        end
+    else
+        -- VORP ve RedEM: veritabani.
+        local ok, rows = pcall(function()
+            return exports['gfxr-bridge']:ExecuteSql('SELECT `item`, `label` FROM `items`', {})
+        end)
+        if ok and type(rows) == "table" then
+            for _, row in pairs(rows) do
+                if type(row.item) == "string" and row.item ~= "" then
+                    out[#out + 1] = { name = row.item, label = row.label or row.item }
+                end
+            end
+        end
+    end
+
+    table.sort(out, function(a, b) return a.name < b.name end)
+    itemCatalog = out
+    return out
+end)
+
+--- ══════════════════════════════════════════════════════════════════
+--- WEAPONS
+---
+--- ⚠️ SILAHLAR ESYA DEGIL. VORP ve RedEM silahlari ayri bir tabloda, kendi
+--- API'siyle tutuyor (`createWeapon` / `giveWeapon`); `AddItem` ile silah
+--- vermeye calismak sessizce hicbir sey yapmiyor. RSG ise silahi normal bir
+--- envanter kalemi olarak tutuyor, orada `AddItem` DOGRU cagri.
+---
+--- Bu ayrimi feature scriptlere birakmiyoruz: golden rule 2 geregi onlar
+--- framework adini hic gormemeli.
+--- ══════════════════════════════════════════════════════════════════
+
+--- Give a weapon to a player.
+---@param source number
+---@param weapon string weapon name (e.g. "WEAPON_REVOLVER_CATTLEMAN")
+---@param ammo number|nil starting ammo
+---@return boolean handled
+exports('AddWeapon', function(source, weapon, ammo)
+    if type(weapon) ~= "string" or weapon == "" then return false end
+    ammo = tonumber(ammo) or 0
+
+    if Bridge.InventoryName == "vorp_inventory" then
+        -- vorp_inventory:createWeapon(source, name, ammoTable, components, comps, serial, custom_label)
+        exports.vorp_inventory:createWeapon(source, weapon, { ammo }, {})
+        return true
+    elseif Bridge.InventoryName == "rsg-inventory" then
+        -- RSG: silah normal bir kalem; mermi meta'da tasiniyor.
+        exports['rsg-inventory']:AddItem(source, string.lower(weapon), 1, false, { ammo = ammo })
+        return true
+    elseif Bridge.InventoryName == "redemrp_inventory" then
+        exports.redemrp_inventory:giveWeapon(source, weapon, ammo)
+        return true
+    end
+    return false
+end)
+
+--- Remove a weapon from a player.
+---@param source number
+---@param weapon string weapon name or serial
+---@return boolean handled
+exports('RemoveWeapon', function(source, weapon)
+    if type(weapon) ~= "string" or weapon == "" then return false end
+
+    if Bridge.InventoryName == "vorp_inventory" then
+        -- VORP silahi SERI NUMARASIYLA siliyor; ada gore silmek icin once
+        -- oyuncunun silahlarini bulup eslesenin id'sini gecmek gerekiyor.
+        local list = exports.vorp_inventory:getUserWeapons(source) or {}
+        local removed = false
+        for _, entry in pairs(list) do
+            local name = entry.name or entry.weapon or (entry.getName and entry:getName())
+            if type(name) == "string" and string.lower(name) == string.lower(weapon) then
+                exports.vorp_inventory:deleteWeapon(source, entry.id or entry.serial)
+                removed = true
+            end
+        end
+        return removed
+    elseif Bridge.InventoryName == "rsg-inventory" then
+        exports['rsg-inventory']:RemoveItem(source, string.lower(weapon), 1)
+        return true
+    elseif Bridge.InventoryName == "redemrp_inventory" then
+        exports.redemrp_inventory:removeWeapon(source, weapon)
+        return true
+    end
+    return false
+end)
+
+--- List a player's weapons.
+---@param source number
+---@return table rows  { { name, ammo, serial } , ... }  (never nil)
+exports('GetWeapons', function(source)
+    local out = {}
+
+    if Bridge.InventoryName == "vorp_inventory" then
+        for _, entry in pairs(exports.vorp_inventory:getUserWeapons(source) or {}) do
+            out[#out + 1] = {
+                name   = entry.name or entry.weapon,
+                ammo   = entry.ammo,
+                serial = entry.id or entry.serial,
+            }
+        end
+    elseif Bridge.InventoryName == "rsg-inventory" then
+        -- RSG'de silah envanterin icinde: adi `weapon_` ile baslayanlari ayikla.
+        for _, item in pairs(exports['gfxr-bridge']:GetItems(source) or {}) do
+            local name = item.name
+            if type(name) == "string" and string.sub(name, 1, 7) == "weapon_" then
+                out[#out + 1] = { name = name, ammo = item.info and item.info.ammo, serial = item.slot }
+            end
+        end
+    elseif Bridge.InventoryName == "redemrp_inventory" then
+        for _, entry in pairs(exports.redemrp_inventory:getUserWeapons(source) or {}) do
+            out[#out + 1] = { name = entry.name, ammo = entry.ammo, serial = entry.id }
+        end
+    end
+
+    return out
+end)
+
 --- Remove item from player inventory
 ---@param source number
 ---@param item string
@@ -385,12 +1183,32 @@ exports('GetItemCount', function(source, item)
     return 0
 end)
 
+--- vorp_inventory export ADLARI SURUME GORE DEGISIYOR ve olmayan bir export
+--- cagrisi HATA firlatir ("No such export ..."), yani cagiran sorgunun tamami
+--- coker. Gercek ornek: bu kurulumda `getInventory` yok, `getUserInventoryItems`
+--- var — oyuncu profili acildiginda panel hata bildirimi basiyordu.
+--- Burada isim listesi sirayla denenir, hicbiri yoksa sessizce nil doner.
+---@param names string[] denenecek export adlari (once GUNCEL isim)
+---@return boolean ok, any result
+local function vorpInventoryCall(names, ...)
+    local args = { ... }
+    for _, name in ipairs(names) do
+        local ok, result = pcall(function()
+            return exports.vorp_inventory[name](exports.vorp_inventory, table.unpack(args))
+        end)
+        if ok then return true, result end
+    end
+    return false, nil
+end
+
 --- Get full player inventory
 ---@param source number
 ---@return table
 exports('GetInventory', function(source)
     if Bridge.InventoryName == "vorp_inventory" then
-        return exports.vorp_inventory:getInventory(source) or {}
+        -- yeni surum: getUserInventoryItems · eski surum: getInventory
+        local ok, items = vorpInventoryCall({ 'getUserInventoryItems', 'getInventory' }, source)
+        return (ok and items) or {}
     elseif Bridge.InventoryName == "rsg-inventory" then
         local player = exports['gfxr-bridge']:GetPlayer(source)
         if player then
@@ -415,10 +1233,15 @@ end)
 ---@return table|nil
 exports('GetItemBySlot', function(source, slot)
     if Bridge.InventoryName == "vorp_inventory" then
-        local ok, item = pcall(function()
-            return exports.vorp_inventory:getItemInSlot(source, slot)
-        end)
-        if ok then return item end
+        local ok, item = vorpInventoryCall({ 'getItemInSlot', 'getItemBySlot' }, source, slot)
+        if ok and item then return item end
+        -- Bu surumde slot export'u yok: envanteri cekip slot alanindan bul.
+        local hasInv, items = vorpInventoryCall({ 'getUserInventoryItems', 'getInventory' }, source)
+        if hasInv and type(items) == 'table' then
+            for _, it in pairs(items) do
+                if (it.slot or it.position) == slot then return it end
+            end
+        end
     elseif Bridge.InventoryName == "rsg-inventory" then
         local player = exports['gfxr-bridge']:GetPlayer(source)
         if player and player.PlayerData and player.PlayerData.items then
@@ -441,7 +1264,7 @@ end)
 ---@return boolean
 exports('UseItem', function(source, item)
     if Bridge.InventoryName == "vorp_inventory" then
-        local ok = pcall(function() exports.vorp_inventory:useItem(source, item, nil) end)
+        local ok = vorpInventoryCall({ 'useItem', 'UseItem' }, source, item, nil)
         return ok
     elseif Bridge.InventoryName == "rsg-inventory" then
         local ok = pcall(function() exports['rsg-inventory']:UseItem(source, item) end)
@@ -610,6 +1433,55 @@ end)
 ---@param source number
 ---@param job string
 ---@param grade number|nil
+--- Oyuncuyu FRAMEWORK'UN KENDI YOLUYLA dirilt.
+---
+--- ⚠️ NEDEN GEREKLI: ped'i native ile diriltmek (`NetworkResurrectLocalPlayer`)
+--- karakteri ayaga kaldiriyor ama framework'un OLUM DURUMUNU birakmiyor.
+--- VORP'ta olculdu: `vorp_core/client/respawnsystem.lua` olurken kendi
+--- scripted kamerasini kuruyor (`StartDeathCam` -> `RenderScriptCams(true)`)
+--- ve yalnizca kendi `ResurrectPlayer` yolu `EndDeathCam()` cagiriyor.
+--- Native diriltme o bayragi (`setDead`) hic gormedigi icin oyuncu
+--- hareket edebiliyor ama KAMERA CESETTE takili kaliyor, HUD kapali kaliyor
+--- ve sunucu hala "olu" biliyor.
+---
+--- ⚠️ Framework'un dosyasi DEGISTIRILMIYOR: VORP zaten `Core.Player.Revive`
+--- diye acik bir API veriyor (server/apicontroller.lua) ve o kendi
+--- `vorp_core:Client:OnPlayerRevive` olayini tetikliyor.
+---
+--- ⚠️ Basarisizlik SESSIZ DEGIL: `false` donuyor ki cagiran taraf native
+--- diriltmeye dusebilsin. Framework yoksa ya da API degistiyse oyuncu
+--- diriltilmeden kalmamali.
+---@param source number
+---@return boolean frameworkun kendi yolu kullanildi mi
+exports('Revive', function(source)
+    if not source then return false end
+
+    if Bridge.FrameworkName == "vorp" then
+        local ok, core = pcall(function() return exports.vorp_core:GetCore() end)
+        if not ok or type(core) ~= "table" then return false end
+        -- ⚠️ TIP KONTROLU YAPMA: cross-resource fonksiyon referansi bir TABLO
+        -- icinde geliyor, `type(x) == "function"` HER ZAMAN false doner
+        -- (ayni tuzak GetRegisteredJobs'ta da yasandi).
+        local okRevive = pcall(function() core.Player.Revive(source, true) end)
+        return okRevive == true
+
+    elseif Bridge.FrameworkName == "rsg" then
+        -- RSG'de diriltme ambulans/olum betiginde; cekirdegin kendi olayi bu.
+        local okEvt = pcall(function()
+            TriggerClientEvent('hospital:client:Revive', source)
+        end)
+        return okEvt == true
+
+    elseif Bridge.FrameworkName == "redem" then
+        local okEvt = pcall(function()
+            TriggerClientEvent('redemrp_respawn:Revive', source)
+        end)
+        return okEvt == true
+    end
+
+    return false
+end)
+
 exports('SetPlayerJob', function(source, job, grade)
     grade = grade or 0
     if Bridge.FrameworkName == "vorp" then
