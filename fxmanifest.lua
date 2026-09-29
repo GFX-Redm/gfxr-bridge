@@ -9,7 +9,7 @@ description "Multi-framework bridge for RedM (VORP, RSG, RedEM:RP)"
 --        VORP TriggerCallback transport fix. Feature scripts (gfxr-hud) require these.
 -- 1.1.1: inventory detection no longer misses a resource still in 'starting'
 --        state on onResourceStart (gfxr-inventory late-start fix).
-version '1.1.1'
+version '1.1.2'
 
 shared_scripts { 'shared/*.lua' }
 client_scripts { 'client/*.lua' }

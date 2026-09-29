@@ -6,6 +6,10 @@ local currentResourceName = GetCurrentResourceName()
 local Frameworks = {
     { name = "vorp", resource = "vorp_core" },
     { name = "rsg",  resource = "rsg-core" },
+    -- ⚠️ Guncel RedEM:RP cekirdegi `redem_roleplay` (RedEM-RP/redem_roleplay);
+    -- eski 1.x surumu `redemrp` idi. Yalnizca eskisi aranirken guncel RedEM
+    -- sunucularinda framework HIC tespit edilmiyordu.
+    { name = "redem", resource = "redem_roleplay" },
     { name = "redem", resource = "redemrp" },
 }
 

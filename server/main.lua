@@ -29,7 +29,14 @@ exports('GetPlayer', function(source)
             return core.Functions.GetPlayer(source)
         end
     elseif Bridge.FrameworkName == "redem" then
-        return exports.redemrp:getPlayerFromId(source)
+        -- Guncel API: exports.redem_roleplay:RedEM().GetPlayer(src). Eski
+        -- `redemrp` kaynaginin `getPlayerFromId` export'u guncel surumde YOK.
+        if Bridge.FrameworkResource == "redem_roleplay" then
+            local ok, RedEM = pcall(function() return exports.redem_roleplay:RedEM() end)
+            return ok and RedEM and RedEM.GetPlayer and RedEM.GetPlayer(source) or nil
+        end
+        local ok, player = pcall(function() return exports.redemrp:getPlayerFromId(source) end)
+        return ok and player or nil
     end
     return nil
 end)
@@ -94,7 +101,7 @@ exports('GetGroup', function(source, useCharacter)
         return player.PlayerData.group
             or (player.PlayerData.metadata and player.PlayerData.metadata.group)
     elseif Bridge.FrameworkName == "redem" then
-        local player = exports.redemrp:getPlayerFromId(source)
+        local player = exports['gfxr-bridge']:GetPlayer(source)
         return player and (player.group or (player.getGroup and player.getGroup())) or nil
     end
     return nil
@@ -124,6 +131,12 @@ exports('GetIdentifier', function(source)
     elseif Bridge.FrameworkName == "redem" then
         local player = exports['gfxr-bridge']:GetPlayer(source)
         if player then
+            -- ⚠️ KARAKTER kimligi: RedEM'de `identifier` HESABIN steam kimligi,
+            -- tum karakterler paylasir; karakter `charid` (1, 2, ...). RedEM'in
+            -- kendi envanteri de `identifier .. "_" .. charid` ile anahtarliyor
+            -- (redemrp_inventory user_inventory). Migrasyon da bu bicimi yaziyor.
+            local charid = player.charid or (player.GetActiveCharacter and player.GetActiveCharacter())
+            if player.identifier and charid then return tostring(player.identifier) .. "_" .. tostring(charid) end
             return player.identifier
         end
     end
@@ -194,7 +207,7 @@ exports('AddMoney', function(source, amount, type)
             if type == "cash" or type == "money" then
                 player.addMoney(amount)
             elseif type == "gold" then
-                player.addGold(amount)
+                if player.addGold then player.addGold(amount) end
             elseif type == "bank" or type == "bankmoney" then
                 player.addBankMoney(amount)
             end
@@ -236,7 +249,7 @@ exports('RemoveMoney', function(source, amount, type)
             if type == "cash" or type == "money" then
                 player.removeMoney(amount)
             elseif type == "gold" then
-                player.removeGold(amount)
+                if player.removeGold then player.removeGold(amount) end
             elseif type == "bank" or type == "bankmoney" then
                 player.removeBankMoney(amount)
             end
@@ -1379,7 +1392,7 @@ exports('GetPlayerJob', function(source)
             return {
                 name = player.job,
                 label = player.job,
-                grade = 0,
+                grade = tonumber(player.jobgrade) or 0,
             }
         end
     end
@@ -1455,7 +1468,8 @@ exports('SetPlayerJob', function(source, job, grade)
     elseif Bridge.FrameworkName == "redem" then
         local player = exports['gfxr-bridge']:GetPlayer(source)
         if player then
-            player.setJob(job)
+            if player.SetJob then player.SetJob(job) elseif player.setJob then player.setJob(job) end
+            if grade and player.SetJobGrade then player.SetJobGrade(grade) end
         end
     end
 end)

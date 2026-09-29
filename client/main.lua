@@ -90,10 +90,18 @@ exports('GetPlayerData', function()
             }
         end
     elseif Bridge.FrameworkName == "redem" then
-        local user = exports.redemrp:getPlayer()
+        -- Guncel: exports.redem_roleplay:GetPlayerData() (identifier yok, citizenid var).
+        local user
+        if Bridge.FrameworkResource == "redem_roleplay" then
+            local ok, d = pcall(function() return exports.redem_roleplay:GetPlayerData() end)
+            user = ok and d and d.isLoggedIn and d or nil
+        else
+            local ok, d = pcall(function() return exports.redemrp:getPlayer() end)
+            user = ok and d or nil
+        end
         if user then
             return {
-                identifier = user.identifier,
+                identifier = user.identifier or user.citizenid,
                 name = user.firstname .. " " .. user.lastname,
                 firstname = user.firstname,
                 lastname = user.lastname,
@@ -387,6 +395,11 @@ end)
 RegisterNetEvent('redemrp:playerLoaded', function()
     OnPlayerLoaded()
 end)
+-- Guncel RedEM:RP karakter secilince (ve her veri degisiminde) bunu yollar;
+-- ilk geldiginde karakter yuklenmis demektir.
+RegisterNetEvent('redemrp:receivePlayerData', function(data)
+    if not playerLoaded and type(data) == 'table' and data.isLoggedIn then OnPlayerLoaded() end
+end)
 
 -- Fallback ONLY for unknown frameworks. For VORP/RSG/RedEM we must NOT use
 -- `playerSpawned` — it fires when the ped spawns into the world (which on VORP
@@ -418,7 +431,7 @@ CreateThread(function()
             local pData = core and core.Functions and core.Functions.GetPlayerData()
             loaded = pData ~= nil and pData.citizenid ~= nil
         elseif Bridge.FrameworkName == "redem" then
-            loaded = exports.redemrp:getPlayer() ~= nil
+            loaded = exports['gfxr-bridge']:GetPlayerData() ~= nil
         end
         if loaded then
             OnPlayerLoaded()
